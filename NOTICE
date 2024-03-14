@@ -1,0 +1,3 @@
+TPM Benchmark is largely a remix of Foxboron's projects which are also MIT licensed:
+ - https://github.com/Foxboron/ssh-tpm-agent
+ - https://github.com/Foxboron/go-tpm-keyfiles
