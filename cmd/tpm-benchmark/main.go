@@ -15,11 +15,11 @@ const usage = `Usage:
     tpm-benchmark [OPTIONS]
 
 Options:
-    -a                      Run all signatures (ECC 256 and RSA 2048) and all
-                            session encryption (none, reuse, ephemeral).
+    --all                   Run all algorithms (ECC 256, RSA 2048 and HMAC) and
+                            all session encryption (none, reuse, ephemeral).
 
-    -s SIGNATURE_TYPE       Choose 'ecc' for 256 bit ECDSA or 'rsa' for 2048 
-                            bit RSASSA signature.
+    -a ALGORITHM            Choose 'ecc' for 256 bit ECDSA, 'rsa' for 2048 
+                            bit RSASSA signature or 'hmac' for SHA256 HMAC.
 
     -e SESSION_ENCRYPTION   Choose 'none', 'reuse' (same session for all
                             signature calls to the TPM) or 'ephemeral' session
@@ -35,7 +35,7 @@ Run default with ECC 256 and no session encryption
     $ tpm-benchmark
 
 Run all tests with parallelism 1
-    $ tpm-benchmark -a
+    $ tpm-benchmark --all
 
 Run RSA 2048 with session encryption reuse
     $ tpm-benchmark -s rsa -e reuse
@@ -55,13 +55,13 @@ func main() {
 	}
 
 	var (
-		allFlag, debugMode                             bool
-		signatureAlgorithm, sessionEncryptionAlgorithm string
-		parallelism, iterations                        int
+		allFlag, debugMode                    bool
+		algorithm, sessionEncryptionAlgorithm string
+		parallelism, iterations               int
 	)
 
-	flag.BoolVar(&allFlag, "a", false, "Run all signatures and all session encryption benchmark")
-	flag.StringVar(&signatureAlgorithm, "s", "", "Signing algorithm 'ecc' or 'rsa'")
+	flag.BoolVar(&allFlag, "all", false, "Run all signatures and all session encryption benchmark")
+	flag.StringVar(&algorithm, "a", "", "Algorithm 'ecc', 'rsa' or 'hmac'")
 	flag.StringVar(&sessionEncryptionAlgorithm, "e", "", "Session encryption 'none', 'reuse', 'ephemeral'")
 	flag.IntVar(&parallelism, "p", 1, "Parallelism 1,2,...,10")
 	flag.IntVar(&iterations, "i", 30, "Iterations 1,2,...,100")
@@ -80,22 +80,25 @@ func main() {
 
 	slog.SetDefault(logger)
 
-	if allFlag && (signatureAlgorithm != "" || sessionEncryptionAlgorithm != "") {
+	if allFlag && (algorithm != "" || sessionEncryptionAlgorithm != "") {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	signatureAlg := tpm2.TPMAlgECC
-	if signatureAlgorithm != "" {
-		if signatureAlgorithm != "rsa" && signatureAlgorithm != "ecc" {
+	signatureAlgorithm := tpm2.TPMAlgECC
+	hmac := false
+	if algorithm != "" {
+		if algorithm != "rsa" && algorithm != "ecc" && algorithm != "hmac" {
 			flag.Usage()
 			os.Exit(1)
 		} else {
-			switch signatureAlgorithm {
+			switch algorithm {
 			case "ecc":
-				signatureAlg = tpm2.TPMAlgECC
+				signatureAlgorithm = tpm2.TPMAlgECC
 			case "rsa":
-				signatureAlg = tpm2.TPMAlgRSA
+				signatureAlgorithm = tpm2.TPMAlgRSA
+			case "hmac":
+				hmac = true
 			}
 		}
 	}
@@ -134,10 +137,22 @@ func main() {
 		var signatureAlgorithm tpm2.TPMAlgID
 		for _, sessionEncryption = range allSessionEncryptions {
 			for _, signatureAlgorithm = range allTpmAlgs {
-				benchmark.Benchmark(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+				err := benchmark.Signature(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+				if err != nil {
+					slog.Debug(err.Error())
+				}
 			}
+
+			benchmark.Hmac(tpm, iterations, parallelism, sessionEncryption)
 		}
 	} else {
-		benchmark.Benchmark(tpm, signatureAlg, iterations, parallelism, sessionEncryption)
+		if hmac {
+			benchmark.Hmac(tpm, iterations, parallelism, sessionEncryption)
+		} else {
+			err := benchmark.Signature(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+			if err != nil {
+				slog.Debug(err.Error())
+			}
+		}
 	}
 }
