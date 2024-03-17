@@ -1,13 +1,13 @@
-package main
+package benchmark
 
 import (
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
-	"github.com/stiankri/tpm-benchmark/benchmark"
 	"log"
+	"log/slog"
 )
 
-func main() {
+func Example() {
 	tpm, err := transport.OpenTPM()
 	if err != nil {
 		log.Fatal(err)
@@ -15,10 +15,10 @@ func main() {
 	defer tpm.Close()
 
 	tpmAlgorithms := []tpm2.TPMAlgID{tpm2.TPMAlgECC, tpm2.TPMAlgRSA}
-	sessionEncryptions := []benchmark.SessionEncryption{benchmark.SessionEncryptionNone}
+	sessionEncryptions := []SessionEncryption{SessionEncryptionNone}
 
 	var (
-		sessionEncryption  benchmark.SessionEncryption
+		sessionEncryption  SessionEncryption
 		signatureAlgorithm tpm2.TPMAlgID
 	)
 
@@ -27,9 +27,12 @@ func main() {
 
 	for _, sessionEncryption = range sessionEncryptions {
 		for _, signatureAlgorithm = range tpmAlgorithms {
-			benchmark.Benchmark(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+			err := Signature(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+			if err != nil {
+				slog.Debug(err.Error())
+			}
 		}
 
-		benchmark.HmacBenchmark(tpm, iterations, parallelism, sessionEncryption)
+		Hmac(tpm, iterations, parallelism, sessionEncryption)
 	}
 }

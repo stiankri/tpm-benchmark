@@ -18,257 +18,34 @@ const (
 	SessionEncryptionEphemeral                   = "SessionEncryptionEphemeral"
 )
 
-type TPMKey struct {
-	emptyAuth   bool
-	policy      []*TPMPolicy
-	secret      []byte
-	authPolicy  []*TPMAuthPolicy
-	description string
-	Parent      tpm2.TPMHandle
-	Pubkey      tpm2.TPMTPublic
-	Privkey     tpm2.TPM2BPrivate
-}
-
-func (t *TPMKey) KeyAlgo() tpm2.TPMAlgID {
-	return t.Pubkey.Type
-}
-
-func (t *TPMKey) SetDescription(s string) {
-	t.description = s
-}
-
-type TPMPolicy struct {
-	commandCode   int
-	commandPolicy []byte
-}
-
-type TPMAuthPolicy struct {
-	name   string
-	policy []*TPMPolicy
-}
-
-type Key struct {
-	*TPMKey
-}
-
-func NewLoadableKey(public tpm2.TPM2BPublic, private tpm2.TPM2BPrivate, parent tpm2.TPMHandle, emptyAuth bool) (*TPMKey, error) {
-	var key TPMKey
-	key.emptyAuth = emptyAuth
-
-	pub, err := public.Contents()
-	if err != nil {
-		return nil, err
-	}
-	key.Pubkey = *pub
-	key.Privkey = private
-
-	key.Parent = parent
-
-	return &key, nil
-}
-
-func CreateSRK(tpm transport.TPMCloser) (*tpm2.AuthHandle, *tpm2.TPMTPublic, error) {
-	srk := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.TPMRHOwner,
-		InSensitive: tpm2.TPM2BSensitiveCreate{
-			Sensitive: &tpm2.TPMSSensitiveCreate{
-				UserAuth: tpm2.TPM2BAuth{
-					Buffer: []byte(nil),
-				},
-			},
-		},
-		InPublic: tpm2.New2B(tpm2.ECCSRKTemplate),
-	}
-
-	var rsp *tpm2.CreatePrimaryResponse
-	rsp, err := srk.Execute(tpm)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed creating primary key: %v", err)
-	}
-
-	srkPublic, err := rsp.OutPublic.Contents()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed getting srk public content: %v", err)
-	}
-
-	return &tpm2.AuthHandle{
-		Handle: rsp.ObjectHandle,
-		Name:   rsp.Name,
-		Auth:   tpm2.PasswordAuth(nil),
-	}, srkPublic, nil
-}
-
-func LoadKeyWithParent(tpm transport.TPMCloser, parent tpm2.AuthHandle, key *Key) (*tpm2.AuthHandle, error) {
-	loadBlobCmd := tpm2.Load{
-		ParentHandle: parent,
-		InPrivate:    key.TPMKey.Privkey,
-		InPublic:     tpm2.New2B(key.TPMKey.Pubkey),
-	}
-	loadBlobRsp, err := loadBlobCmd.Execute(tpm)
-	if err != nil {
-		return nil, fmt.Errorf("failed getting handle: %v", err)
-	}
-
-	// Return a AuthHandle with a nil PasswordAuth
-	return &tpm2.AuthHandle{
-		Handle: loadBlobRsp.ObjectHandle,
-		Name:   loadBlobRsp.Name,
-		Auth:   tpm2.PasswordAuth(nil),
-	}, nil
-}
-
-func createECCKey(ecc tpm2.TPMECCCurve, sha tpm2.TPMAlgID) tpm2.TPM2B[tpm2.TPMTPublic, *tpm2.TPMTPublic] {
-	return tpm2.New2B(tpm2.TPMTPublic{
-		Type:    tpm2.TPMAlgECC,
-		NameAlg: sha,
-		ObjectAttributes: tpm2.TPMAObject{
-			SignEncrypt:         true,
-			FixedTPM:            true,
-			FixedParent:         true,
-			SensitiveDataOrigin: true,
-			UserWithAuth:        true,
-		},
-		Parameters: tpm2.NewTPMUPublicParms(
-			tpm2.TPMAlgECC,
-			&tpm2.TPMSECCParms{
-				CurveID: ecc,
-				Scheme: tpm2.TPMTECCScheme{
-					Scheme: tpm2.TPMAlgNull,
-				},
-			},
-		),
-	})
-}
-
-func createRSAKey(bits tpm2.TPMKeyBits, sha tpm2.TPMAlgID) tpm2.TPM2B[tpm2.TPMTPublic, *tpm2.TPMTPublic] {
-	return tpm2.New2B(tpm2.TPMTPublic{
-		Type:    tpm2.TPMAlgRSA,
-		NameAlg: sha,
-		ObjectAttributes: tpm2.TPMAObject{
-			SignEncrypt:         true,
-			FixedTPM:            true,
-			FixedParent:         true,
-			SensitiveDataOrigin: true,
-			UserWithAuth:        true,
-		},
-		Parameters: tpm2.NewTPMUPublicParms(
-			tpm2.TPMAlgRSA,
-			&tpm2.TPMSRSAParms{
-				Scheme: tpm2.TPMTRSAScheme{
-					Scheme: tpm2.TPMAlgNull,
-				},
-				KeyBits: bits,
-			},
-		),
-	})
-}
-
-// shadow the unexported interface from go-tpm
-type handle interface {
-	HandleValue() uint32
-	KnownName() *tpm2.TPM2BName
-}
-
-// Helper to flush handles
-func FlushHandle(tpm transport.TPM, h handle) {
-	flushSrk := tpm2.FlushContext{FlushHandle: h}
-	flushSrk.Execute(tpm)
-}
-
-func CreateKey(tpm transport.TPMCloser, keytype tpm2.TPMAlgID) (*Key, error) {
-	var comment = ""
-
-	srkHandle, srkPublic, err := CreateSRK(tpm)
-	if err != nil {
-		return nil, fmt.Errorf("failed creating SRK: %v", err)
-	}
-
-	var keyPublic tpm2.TPM2BPublic
-	switch keytype {
-	case tpm2.TPMAlgECC:
-		keyPublic = createECCKey(tpm2.TPMECCNistP256, tpm2.TPMAlgSHA256)
-	case tpm2.TPMAlgRSA:
-		keyPublic = createRSAKey(2048, tpm2.TPMAlgSHA256)
-	default:
-		return nil, fmt.Errorf("unsupported key type")
-	}
-
-	defer FlushHandle(tpm, srkHandle)
-
-	// Template for en ECC key for signing
-	createKey := tpm2.Create{
-		ParentHandle: srkHandle,
-		InPublic:     keyPublic,
-	}
-
-	emptyAuth := true
-
-	var createRsp *tpm2.CreateResponse
-	createRsp, err = createKey.Execute(tpm,
-		tpm2.HMAC(tpm2.TPMAlgSHA256, 16,
-			tpm2.AESEncryption(128, tpm2.EncryptIn),
-			tpm2.Salted(srkHandle.Handle, *srkPublic)))
-	if err != nil {
-		return nil, fmt.Errorf("failed creating TPM key: %v", err)
-	}
-
-	tpmkey, err := NewLoadableKey(createRsp.OutPublic, createRsp.OutPrivate, srkHandle.Handle, emptyAuth)
-	if err != nil {
-		return nil, err
-	}
-
-	tpmkey.SetDescription(comment)
-
-	return &Key{tpmkey}, nil
-}
-
-func newECCSigScheme(digest tpm2.TPMAlgID) tpm2.TPMTSigScheme {
-	return tpm2.TPMTSigScheme{
-		Scheme: tpm2.TPMAlgECDSA,
-		Details: tpm2.NewTPMUSigScheme(
-			tpm2.TPMAlgECDSA,
-			&tpm2.TPMSSchemeHash{
-				HashAlg: digest,
-			},
-		),
-	}
-}
-
-func newRSASigScheme(digest tpm2.TPMAlgID) tpm2.TPMTSigScheme {
-	return tpm2.TPMTSigScheme{
-		Scheme: tpm2.TPMAlgRSASSA,
-		Details: tpm2.NewTPMUSigScheme(
-			tpm2.TPMAlgRSASSA,
-			&tpm2.TPMSSchemeHash{
-				HashAlg: digest,
-			},
-		),
-	}
-}
-
-func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, parallelism int, sessionEncryption SessionEncryption) error {
-	var digest = []byte("12341234123412341234123412341234")
+func Signature(tpm transport.TPMCloser, keyType tpm2.TPMAlgID, iterations int, parallelism int, sessionEncryption SessionEncryption) error {
+	digest := []byte("12341234123412341234123412341234")
 	digestalg := tpm2.TPMAlgSHA256
+
+	k, err := createKey(tpm, keyType)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	digestlength := 32
 	if len(digest) != digestlength {
 		return fmt.Errorf("incorrect checksum length. expected %v got %v", digestlength, len(digest))
 	}
 
-	srkHandle, srkPublic, err := CreateSRK(tpm)
+	srkHandle, srkPublic, err := createSRK(tpm)
 	if err != nil {
 		return fmt.Errorf("failed creating SRK: %v", err)
 	}
-	defer FlushHandle(tpm, srkHandle)
+	defer flushHandle(tpm, srkHandle)
 
-	handle, err := LoadKeyWithParent(tpm, *srkHandle, k)
+	handle, err := loadKeyWithParent(tpm, *srkHandle, k)
 	if err != nil {
 		return err
 	}
-	defer FlushHandle(tpm, handle)
+	defer flushHandle(tpm, handle)
 
 	var sigscheme tpm2.TPMTSigScheme
-	switch k.TPMKey.KeyAlgo() {
+	switch k.tPMKey.KeyAlgo() {
 	case tpm2.TPMAlgECC:
 		sigscheme = newECCSigScheme(digestalg)
 	case tpm2.TPMAlgRSA:
@@ -324,7 +101,7 @@ func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, paralle
 			return fmt.Errorf("failed to sign: %v", err)
 		}
 
-		switch k.TPMKey.KeyAlgo() {
+		switch k.tPMKey.KeyAlgo() {
 		case tpm2.TPMAlgECC:
 			_, err := rspSign.Signature.Signature.ECDSA()
 			if err != nil {
@@ -386,11 +163,11 @@ func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, paralle
 
 	fmt.Println("## TPM SIGNATURE BENCHMARK RUN ##")
 
-	switch k.TPMKey.KeyAlgo() {
+	switch k.tPMKey.KeyAlgo() {
 	case tpm2.TPMAlgECC:
-		fmt.Println("  Key type: ECC 256")
+		fmt.Println("  key type: ECC 256")
 	case tpm2.TPMAlgRSA:
-		fmt.Println("  Key type: RSA 2048")
+		fmt.Println("  key type: RSA 2048")
 	}
 	fmt.Printf("  Session: %s\n", sessionEncryption)
 
@@ -404,30 +181,18 @@ func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, paralle
 	return nil
 }
 
-func Benchmark(tpm transport.TPMCloser, keyType tpm2.TPMAlgID, iterations int, parallelism int, sessionEncryption SessionEncryption) {
-	k, err := CreateKey(tpm, keyType)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = signatureBenchmark(tpm, k, iterations, parallelism, sessionEncryption)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func HmacBenchmark(tpm transport.TPMCloser, iterations int, parallelism int, sessionEncryption SessionEncryption) {
-	var digest = []byte("12341234123412341234123412341234")
+func Hmac(tpm transport.TPMCloser, iterations int, parallelism int, sessionEncryption SessionEncryption) {
+	digest := []byte("12341234123412341234123412341234")
 
 	var srkHandle *tpm2.AuthHandle
 	var srkPublic *tpm2.TPMTPublic
 	var err error
 	if sessionEncryption == SessionEncryptionReuse || sessionEncryption == SessionEncryptionEphemeral {
-		srkHandle, srkPublic, err = CreateSRK(tpm)
+		srkHandle, srkPublic, err = createSRK(tpm)
 		if err != nil {
 			slog.Debug("failed creating SRK: %v", err)
 		}
-		defer FlushHandle(tpm, srkHandle)
+		defer flushHandle(tpm, srkHandle)
 	}
 
 	createPrimary := tpm2.CreatePrimary{
@@ -566,4 +331,232 @@ func HmacBenchmark(tpm transport.TPMCloser, iterations int, parallelism int, ses
 	fmt.Printf("  Completed HMACs: %d of %d\n", correct.Load(), hmacs)
 	fmt.Printf("  HMACs/second: %f\n", float64(correct.Load())/elapsed)
 	fmt.Printf("  Average latency: %f seconds\n", elapsed/float64(correct.Load()))
+}
+
+type tPMKey struct {
+	emptyAuth   bool
+	policy      []*tPMPolicy
+	secret      []byte
+	authPolicy  []*tPMAuthPolicy
+	description string
+	Parent      tpm2.TPMHandle
+	Pubkey      tpm2.TPMTPublic
+	Privkey     tpm2.TPM2BPrivate
+}
+
+func (t *tPMKey) KeyAlgo() tpm2.TPMAlgID {
+	return t.Pubkey.Type
+}
+
+func (t *tPMKey) SetDescription(s string) {
+	t.description = s
+}
+
+type tPMPolicy struct {
+	commandCode   int
+	commandPolicy []byte
+}
+
+type tPMAuthPolicy struct {
+	name   string
+	policy []*tPMPolicy
+}
+
+type key struct {
+	*tPMKey
+}
+
+func newLoadableKey(public tpm2.TPM2BPublic, private tpm2.TPM2BPrivate, parent tpm2.TPMHandle, emptyAuth bool) (*tPMKey, error) {
+	var key tPMKey
+	key.emptyAuth = emptyAuth
+
+	pub, err := public.Contents()
+	if err != nil {
+		return nil, err
+	}
+	key.Pubkey = *pub
+	key.Privkey = private
+
+	key.Parent = parent
+
+	return &key, nil
+}
+
+func createSRK(tpm transport.TPMCloser) (*tpm2.AuthHandle, *tpm2.TPMTPublic, error) {
+	srk := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{
+					Buffer: []byte(nil),
+				},
+			},
+		},
+		InPublic: tpm2.New2B(tpm2.ECCSRKTemplate),
+	}
+
+	var rsp *tpm2.CreatePrimaryResponse
+	rsp, err := srk.Execute(tpm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed creating primary key: %v", err)
+	}
+
+	srkPublic, err := rsp.OutPublic.Contents()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed getting srk public content: %v", err)
+	}
+
+	return &tpm2.AuthHandle{
+		Handle: rsp.ObjectHandle,
+		Name:   rsp.Name,
+		Auth:   tpm2.PasswordAuth(nil),
+	}, srkPublic, nil
+}
+
+func loadKeyWithParent(tpm transport.TPMCloser, parent tpm2.AuthHandle, key *key) (*tpm2.AuthHandle, error) {
+	loadBlobCmd := tpm2.Load{
+		ParentHandle: parent,
+		InPrivate:    key.tPMKey.Privkey,
+		InPublic:     tpm2.New2B(key.tPMKey.Pubkey),
+	}
+	loadBlobRsp, err := loadBlobCmd.Execute(tpm)
+	if err != nil {
+		return nil, fmt.Errorf("failed getting handle: %v", err)
+	}
+
+	// Return a AuthHandle with a nil PasswordAuth
+	return &tpm2.AuthHandle{
+		Handle: loadBlobRsp.ObjectHandle,
+		Name:   loadBlobRsp.Name,
+		Auth:   tpm2.PasswordAuth(nil),
+	}, nil
+}
+
+func createECCKey(ecc tpm2.TPMECCCurve, sha tpm2.TPMAlgID) tpm2.TPM2B[tpm2.TPMTPublic, *tpm2.TPMTPublic] {
+	return tpm2.New2B(tpm2.TPMTPublic{
+		Type:    tpm2.TPMAlgECC,
+		NameAlg: sha,
+		ObjectAttributes: tpm2.TPMAObject{
+			SignEncrypt:         true,
+			FixedTPM:            true,
+			FixedParent:         true,
+			SensitiveDataOrigin: true,
+			UserWithAuth:        true,
+		},
+		Parameters: tpm2.NewTPMUPublicParms(
+			tpm2.TPMAlgECC,
+			&tpm2.TPMSECCParms{
+				CurveID: ecc,
+				Scheme: tpm2.TPMTECCScheme{
+					Scheme: tpm2.TPMAlgNull,
+				},
+			},
+		),
+	})
+}
+
+func createRSAKey(bits tpm2.TPMKeyBits, sha tpm2.TPMAlgID) tpm2.TPM2B[tpm2.TPMTPublic, *tpm2.TPMTPublic] {
+	return tpm2.New2B(tpm2.TPMTPublic{
+		Type:    tpm2.TPMAlgRSA,
+		NameAlg: sha,
+		ObjectAttributes: tpm2.TPMAObject{
+			SignEncrypt:         true,
+			FixedTPM:            true,
+			FixedParent:         true,
+			SensitiveDataOrigin: true,
+			UserWithAuth:        true,
+		},
+		Parameters: tpm2.NewTPMUPublicParms(
+			tpm2.TPMAlgRSA,
+			&tpm2.TPMSRSAParms{
+				Scheme: tpm2.TPMTRSAScheme{
+					Scheme: tpm2.TPMAlgNull,
+				},
+				KeyBits: bits,
+			},
+		),
+	})
+}
+
+// shadow the unexported interface from go-tpm
+type handle interface {
+	HandleValue() uint32
+	KnownName() *tpm2.TPM2BName
+}
+
+// Helper to flush handles
+func flushHandle(tpm transport.TPM, h handle) {
+	flushSrk := tpm2.FlushContext{FlushHandle: h}
+	flushSrk.Execute(tpm)
+}
+
+func createKey(tpm transport.TPMCloser, keytype tpm2.TPMAlgID) (*key, error) {
+	comment := ""
+
+	srkHandle, srkPublic, err := createSRK(tpm)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating SRK: %v", err)
+	}
+
+	var keyPublic tpm2.TPM2BPublic
+	switch keytype {
+	case tpm2.TPMAlgECC:
+		keyPublic = createECCKey(tpm2.TPMECCNistP256, tpm2.TPMAlgSHA256)
+	case tpm2.TPMAlgRSA:
+		keyPublic = createRSAKey(2048, tpm2.TPMAlgSHA256)
+	default:
+		return nil, fmt.Errorf("unsupported key type")
+	}
+
+	defer flushHandle(tpm, srkHandle)
+
+	// Template for en ECC key for signing
+	createKey := tpm2.Create{
+		ParentHandle: srkHandle,
+		InPublic:     keyPublic,
+	}
+
+	emptyAuth := true
+
+	var createRsp *tpm2.CreateResponse
+	createRsp, err = createKey.Execute(tpm,
+		tpm2.HMAC(tpm2.TPMAlgSHA256, 16,
+			tpm2.AESEncryption(128, tpm2.EncryptIn),
+			tpm2.Salted(srkHandle.Handle, *srkPublic)))
+	if err != nil {
+		return nil, fmt.Errorf("failed creating TPM key: %v", err)
+	}
+
+	tpmkey, err := newLoadableKey(createRsp.OutPublic, createRsp.OutPrivate, srkHandle.Handle, emptyAuth)
+	if err != nil {
+		return nil, err
+	}
+
+	tpmkey.SetDescription(comment)
+
+	return &key{tpmkey}, nil
+}
+
+func newECCSigScheme(digest tpm2.TPMAlgID) tpm2.TPMTSigScheme {
+	return tpm2.TPMTSigScheme{
+		Scheme: tpm2.TPMAlgECDSA,
+		Details: tpm2.NewTPMUSigScheme(
+			tpm2.TPMAlgECDSA,
+			&tpm2.TPMSSchemeHash{
+				HashAlg: digest,
+			},
+		),
+	}
+}
+
+func newRSASigScheme(digest tpm2.TPMAlgID) tpm2.TPMTSigScheme {
+	return tpm2.TPMTSigScheme{
+		Scheme: tpm2.TPMAlgRSASSA,
+		Details: tpm2.NewTPMUSigScheme(
+			tpm2.TPMAlgRSASSA,
+			&tpm2.TPMSSchemeHash{
+				HashAlg: digest,
+			},
+		),
+	}
 }

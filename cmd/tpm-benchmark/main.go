@@ -137,16 +137,22 @@ func main() {
 		var signatureAlgorithm tpm2.TPMAlgID
 		for _, sessionEncryption = range allSessionEncryptions {
 			for _, signatureAlgorithm = range allTpmAlgs {
-				benchmark.Benchmark(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+				err := benchmark.Signature(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+				if err != nil {
+					slog.Debug(err.Error())
+				}
 			}
 
-			benchmark.HmacBenchmark(tpm, iterations, parallelism, sessionEncryption)
+			benchmark.Hmac(tpm, iterations, parallelism, sessionEncryption)
 		}
 	} else {
 		if hmac {
-			benchmark.HmacBenchmark(tpm, iterations, parallelism, sessionEncryption)
+			benchmark.Hmac(tpm, iterations, parallelism, sessionEncryption)
 		} else {
-			benchmark.Benchmark(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+			err := benchmark.Signature(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
+			if err != nil {
+				slog.Debug(err.Error())
+			}
 		}
 	}
 }
