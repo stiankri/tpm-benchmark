@@ -384,7 +384,7 @@ func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, paralle
 		return fmt.Errorf("internal error")
 	}
 
-	fmt.Println("## TPM BENCHMARK RUN RESULTS ##")
+	fmt.Println("## TPM SIGNATURE BENCHMARK RUN RESULTS ##")
 
 	switch k.TPMKey.KeyAlgo() {
 	case tpm2.TPMAlgECC:
@@ -414,4 +414,93 @@ func Benchmark(tpm transport.TPMCloser, keyType tpm2.TPMAlgID, iterations int, p
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	hmacBenchmark(tpm, iterations)
+}
+
+func hmacBenchmark(tpm transport.TPMCloser, iterations int) {
+	var digest = []byte("12341234123412341234123412341234")
+
+	createPrimary := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InPublic: tpm2.New2B(tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgKeyedHash,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				SignEncrypt:         true,
+				FixedTPM:            true,
+				FixedParent:         true,
+				SensitiveDataOrigin: true,
+				UserWithAuth:        true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgKeyedHash,
+				&tpm2.TPMSKeyedHashParms{
+					Scheme: tpm2.TPMTKeyedHashScheme{
+						Scheme: tpm2.TPMAlgHMAC,
+						Details: tpm2.NewTPMUSchemeKeyedHash(tpm2.TPMAlgHMAC,
+							&tpm2.TPMSSchemeHMAC{
+								HashAlg: tpm2.TPMAlgSHA256,
+							}),
+					},
+				}),
+		}),
+	}
+
+	primaryResponse, err := createPrimary.Execute(tpm)
+	if err != nil {
+		slog.Debug(err.Error())
+	}
+
+	flushContext := tpm2.FlushContext{FlushHandle: primaryResponse.ObjectHandle}
+	defer func() {
+		_, _ = flushContext.Execute(tpm)
+	}()
+
+	var correct atomic.Uint64
+	var tpmFail atomic.Uint64
+	var duration atomic.Int64
+
+	for _ = range iterations {
+		start := time.Now()
+
+		hmac := tpm2.Hmac{
+			Handle: tpm2.AuthHandle{
+				Handle: primaryResponse.ObjectHandle,
+				Name:   primaryResponse.Name,
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+			Buffer: tpm2.TPM2BMaxBuffer{
+				Buffer: digest,
+			},
+			HashAlg: tpm2.TPMAlgSHA256,
+		}
+
+		hmacResponse, err := hmac.Execute(tpm)
+		if err != nil {
+			tpmFail.Add(1)
+			slog.Debug(err.Error())
+		} else {
+			_ = hmacResponse.OutHmac
+			correct.Add(1)
+			duration.Add(time.Since(start).Microseconds())
+		}
+	}
+
+	if uint64(iterations) != tpmFail.Load()+correct.Load() {
+		slog.Debug("internal error")
+	}
+
+	elapsed := float64(duration.Load()) / 1000000.0
+
+	fmt.Println("## TPM HMAC BENCHMARK RUN RESULTS ##")
+
+	fmt.Println("  HASH: SHA256")
+	// fmt.Printf("  Session: %s\n", sessionEncryption)
+
+	fmt.Printf("  Iterations: %d\n", iterations)
+	// fmt.Printf("  Parallelism: %d\n", len(resultChannels))
+	fmt.Printf("  Time elapsed %f seconds\n", elapsed)
+	// fmt.Printf("  Completed signatures: %d of %d\n", correct.Load(), signatures)
+	fmt.Printf("  Hashes/second: %f\n", float64(correct.Load())/elapsed)
+	fmt.Printf("  Average latency: %f seconds\n", elapsed/float64(correct.Load()))
 }
