@@ -384,7 +384,7 @@ func signatureBenchmark(tpm transport.TPMCloser, k *Key, iterations int, paralle
 		return fmt.Errorf("internal error")
 	}
 
-	fmt.Println("## TPM SIGNATURE BENCHMARK RUN RESULTS ##")
+	fmt.Println("## TPM SIGNATURE BENCHMARK RUN ##")
 
 	switch k.TPMKey.KeyAlgo() {
 	case tpm2.TPMAlgECC:
@@ -414,12 +414,21 @@ func Benchmark(tpm transport.TPMCloser, keyType tpm2.TPMAlgID, iterations int, p
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	hmacBenchmark(tpm, iterations)
 }
 
-func hmacBenchmark(tpm transport.TPMCloser, iterations int) {
+func HmacBenchmark(tpm transport.TPMCloser, iterations int, parallelism int, sessionEncryption SessionEncryption) {
 	var digest = []byte("12341234123412341234123412341234")
+
+	var srkHandle *tpm2.AuthHandle
+	var srkPublic *tpm2.TPMTPublic
+	var err error
+	if sessionEncryption == SessionEncryptionReuse || sessionEncryption == SessionEncryptionEphemeral {
+		srkHandle, srkPublic, err = CreateSRK(tpm)
+		if err != nil {
+			slog.Debug("failed creating SRK: %v", err)
+		}
+		defer FlushHandle(tpm, srkHandle)
+	}
 
 	createPrimary := tpm2.CreatePrimary{
 		PrimaryHandle: tpm2.TPMRHOwner,
@@ -460,7 +469,19 @@ func hmacBenchmark(tpm transport.TPMCloser, iterations int) {
 	var tpmFail atomic.Uint64
 	var duration atomic.Int64
 
-	for _ = range iterations {
+	var reusedSession tpm2.Session
+	var reusedSessionCloser func() error = nil
+
+	if sessionEncryption == SessionEncryptionReuse {
+		reusedSession, reusedSessionCloser, err = tpm2.HMACSession(tpm, tpm2.TPMAlgSHA256, 16,
+			tpm2.AESEncryption(128, tpm2.EncryptIn),
+			tpm2.Salted(srkHandle.Handle, *srkPublic))
+		if err != nil {
+			slog.Debug("%s", err)
+		}
+	}
+
+	hmacFunction := func() error {
 		start := time.Now()
 
 		hmac := tpm2.Hmac{
@@ -475,14 +496,48 @@ func hmacBenchmark(tpm transport.TPMCloser, iterations int) {
 			HashAlg: tpm2.TPMAlgSHA256,
 		}
 
-		hmacResponse, err := hmac.Execute(tpm)
+		var hmacResponse *tpm2.HmacResponse
+		var err error
+
+		switch sessionEncryption {
+		case SessionEncryptionNone:
+			hmacResponse, err = hmac.Execute(tpm)
+		case SessionEncryptionEphemeral:
+			session := tpm2.HMAC(tpm2.TPMAlgSHA256, 16,
+				tpm2.AESEncryption(128, tpm2.EncryptIn),
+				tpm2.Salted(srkHandle.Handle, *srkPublic))
+			hmacResponse, err = hmac.Execute(tpm, session)
+		case SessionEncryptionReuse:
+			hmacResponse, err = hmac.Execute(tpm, reusedSession)
+		default:
+			return fmt.Errorf("unsupported sessionEncryption")
+		}
+
 		if err != nil {
 			tpmFail.Add(1)
-			slog.Debug(err.Error())
-		} else {
-			_ = hmacResponse.OutHmac
-			correct.Add(1)
-			duration.Add(time.Since(start).Microseconds())
+			return fmt.Errorf("failed to hmac: %v", err)
+		}
+
+		_ = hmacResponse.OutHmac
+		correct.Add(1)
+		duration.Add(time.Since(start).Microseconds())
+
+		return nil
+	}
+
+	var results []error
+	resultChannels := make([]chan error, parallelism)
+	for i := 0; i < iterations; i++ {
+		for j := 0; j < parallelism; j++ {
+			resultChannels[j] = make(chan error)
+
+			k := j
+			go func() {
+				resultChannels[k] <- hmacFunction()
+			}()
+		}
+		for j := 0; j < len(resultChannels); j++ {
+			results = append(results, <-resultChannels[j])
 		}
 	}
 
@@ -490,17 +545,25 @@ func hmacBenchmark(tpm transport.TPMCloser, iterations int) {
 		slog.Debug("internal error")
 	}
 
-	elapsed := float64(duration.Load()) / 1000000.0
+	if reusedSessionCloser != nil {
+		err = reusedSessionCloser()
+		if err != nil {
+			slog.Debug("%s", err)
+		}
+	}
 
-	fmt.Println("## TPM HMAC BENCHMARK RUN RESULTS ##")
+	elapsed := float64(duration.Load()) / 1000000.0
+	hmacs := iterations * len(resultChannels)
+
+	fmt.Println("## TPM HMAC BENCHMARK RUN ##")
 
 	fmt.Println("  HASH: SHA256")
-	// fmt.Printf("  Session: %s\n", sessionEncryption)
+	fmt.Printf("  Session: %s\n", sessionEncryption)
 
 	fmt.Printf("  Iterations: %d\n", iterations)
-	// fmt.Printf("  Parallelism: %d\n", len(resultChannels))
+	fmt.Printf("  Parallelism: %d\n", len(resultChannels))
 	fmt.Printf("  Time elapsed %f seconds\n", elapsed)
-	// fmt.Printf("  Completed signatures: %d of %d\n", correct.Load(), signatures)
-	fmt.Printf("  Hashes/second: %f\n", float64(correct.Load())/elapsed)
+	fmt.Printf("  Completed HMACs: %d of %d\n", correct.Load(), hmacs)
+	fmt.Printf("  HMACs/second: %f\n", float64(correct.Load())/elapsed)
 	fmt.Printf("  Average latency: %f seconds\n", elapsed/float64(correct.Load()))
 }

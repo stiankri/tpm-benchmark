@@ -29,5 +29,7 @@ func main() {
 		for _, signatureAlgorithm = range tpmAlgorithms {
 			benchmark.Benchmark(tpm, signatureAlgorithm, iterations, parallelism, sessionEncryption)
 		}
+
+		benchmark.HmacBenchmark(tpm, iterations, parallelism, sessionEncryption)
 	}
 }
